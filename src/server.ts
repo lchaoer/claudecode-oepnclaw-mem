@@ -2,6 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { memoryForget, memorySearch, memoryStore } from "./tools.js";
+import { KNOWLEDGE_PATH } from "./config.js";
+import { getDb } from "./db.js";
+import { syncKnowledge } from "./knowledge.js";
 
 const server = new McpServer({
   name: "claudecode-oepnclaw-mem",
@@ -68,6 +71,10 @@ server.registerTool(
 );
 
 async function main() {
+  // 启动时首次同步知识索引
+  if (KNOWLEDGE_PATH) {
+    syncKnowledge(getDb());
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
