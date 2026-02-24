@@ -1,4 +1,4 @@
-export type MemoryCategory = "preference" | "fact" | "decision" | "entity" | "other";
+export type MemoryCategory = "preference" | "fact" | "decision" | "entity" | "other" | "knowledge";
 
 export type MemoryEntry = {
   id: string;
