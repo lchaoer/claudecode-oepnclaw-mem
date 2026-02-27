@@ -34,9 +34,15 @@ npm start
 
 ## 4. 工具接口
 
-- `memory_store(text, category?)` — 写入一条长期记忆
+- `memory_store(text, category?)` — 写入一条长期记忆（带去重）
 - `memory_search(query, limit?)` — 搜索记忆（合并三个数据源）
 - `memory_forget(id)` — 删除一条记忆
+
+### 4.0 memory_store 去重说明
+
+- 使用 `sha256(text + category)` 作为唯一 hash
+- SQLite `UNIQUE(hash)` 强制去重
+- 重复写入返回 `action: "duplicate"`（成功则 `action: "stored"`）
 
 ### 4.1 memory_search 数据源
 
@@ -46,7 +52,10 @@ npm start
 2. **会话历史（history.jsonl）**：关键词评分匹配用户历史 prompt
 3. **知识索引（knowledge_chunks）**：对知识目录 `.md` 文件分块后的 FTS5 检索
 
-三个来源按 score 降序 + 时间降序合并，返回 Top N。
+**排序策略**：
+- 先对每个来源取 **TopK** 候选（`limit * 5`，上限 50）
+- 再统一重排：`score + 重要度加权`（来源权重 + 结构权重 + 类别权重）
+- 按 `finalScore` 降序 + 时间降序取 Top N
 
 ## 5. 知识索引功能
 

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "./db.js";
 import { readHistoryEntries } from "./history.js";
 import { searchKnowledge, syncKnowledgeIfNeeded } from "./knowledge.js";
@@ -10,6 +10,30 @@ const SCORE_MATCH = 10;
 const SCORE_OCCURRENCE = 2;
 const SCORE_EARLY = 5;
 const SCORE_LENGTH_PENALTY = 0.02;
+
+const CANDIDATE_MULTIPLIER = 5;
+const CANDIDATE_MAX = 50;
+
+const SOURCE_WEIGHT = {
+  memory: 1.0,
+  knowledge: 0.9,
+  history: 0.6,
+} as const;
+
+const CATEGORY_BONUS = {
+  decision: 0.8,
+  preference: 0.6,
+  fact: 0.3,
+  entity: 0.2,
+  other: 0,
+  knowledge: 0,
+} as const;
+
+const STRUCTURE_BONUS = {
+  heading: 0.6,
+  listItem: 0.4,
+  codeBlock: 0.3,
+} as const;
 
 function scoreText(text: string, query: string): number {
   const haystack = text.toLowerCase();
@@ -33,16 +57,43 @@ function scoreText(text: string, query: string): number {
   return SCORE_MATCH + count * SCORE_OCCURRENCE + earlyBonus - lengthPenalty;
 }
 
+function importanceScore(
+  text: string,
+  category: MemorySearchResult["category"],
+  source: keyof typeof SOURCE_WEIGHT,
+): number {
+  let score = 0;
+  const lines = text.split("\n");
+  const heading = lines.find((line) => /^#{1,6}\s+/.test(line));
+  if (heading) score += STRUCTURE_BONUS.heading;
+  const listItem = lines.find((line) => /^\s*(?:[-*]|\d+\.)\s+/.test(line));
+  if (listItem) score += STRUCTURE_BONUS.listItem;
+  const hasCode = /```[\s\S]*?```/.test(text);
+  if (hasCode) score += STRUCTURE_BONUS.codeBlock;
+  score += CATEGORY_BONUS[category] ?? 0;
+  score += SOURCE_WEIGHT[source] ?? 0;
+  return score;
+}
+
 export function memoryStore(input: unknown) {
   const parsed = memoryStoreSchema.parse(input);
   const id = randomUUID();
   const createdAt = Date.now();
   const db = getDb();
+  const hash = createHash("sha256")
+    .update(`${parsed.text}\n${parsed.category}`, "utf-8")
+    .digest("hex");
+
   const stmt = db.prepare(
-    "INSERT INTO memories (id, text, category, created_at) VALUES (?, ?, ?, ?)",
+    "INSERT OR IGNORE INTO memories (id, text, category, created_at, hash) VALUES (?, ?, ?, ?, ?)",
   );
-  stmt.run(id, parsed.text, parsed.category, createdAt);
-  return { id, createdAt };
+  const result = stmt.run(id, parsed.text, parsed.category, createdAt, hash);
+
+  if (result.changes === 0) {
+    return { id, createdAt, action: "duplicate" as const };
+  }
+
+  return { id, createdAt, action: "stored" as const };
 }
 
 export function memorySearch(input: unknown) {
@@ -57,6 +108,7 @@ export function memorySearch(input: unknown) {
     .filter((t) => t.length > 0);
 
   let dbScored: Array<MemorySearchResult & { createdAt: number }> = [];
+  const candidateLimit = Math.min(parsed.limit * CANDIDATE_MULTIPLIER, CANDIDATE_MAX);
 
   if (tokens.length > 0) {
     const ftsQuery = tokens.map((t) => `"${t}"*`).join(" OR ");
@@ -69,7 +121,7 @@ export function memorySearch(input: unknown) {
          ORDER BY rank
          LIMIT ?`,
       )
-      .all(ftsQuery, parsed.limit * 3) as Array<{
+      .all(ftsQuery, candidateLimit) as Array<{
         id: string; text: string; category: string; created_at: number; rank: number;
       }>;
 
@@ -100,7 +152,9 @@ export function memorySearch(input: unknown) {
         score: scoreText(row.text, parsed.query),
         createdAt: row.created_at,
       }))
-      .filter((row) => row.score > 0);
+      .filter((row) => row.score > 0)
+      .sort((a, b) => (b.score - a.score) || (b.createdAt - a.createdAt))
+      .slice(0, candidateLimit);
   }
 
   const historyScored: Array<MemorySearchResult & { createdAt: number }> = readHistoryEntries()
@@ -114,13 +168,15 @@ export function memorySearch(input: unknown) {
         createdAt: entry.timestamp ?? 0,
       };
     })
-    .filter((row) => row.text.length > 0 && row.score > 0);
+    .filter((row) => row.text.length > 0 && row.score > 0)
+    .sort((a, b) => (b.score - a.score) || (b.createdAt - a.createdAt))
+    .slice(0, candidateLimit);
 
   // 知识库检索
   let knowledgeScored: Array<MemorySearchResult & { createdAt: number }> = [];
   if (KNOWLEDGE_PATH) {
     syncKnowledgeIfNeeded(db);
-    const knowledgeRows = searchKnowledge(db, parsed.query, parsed.limit);
+    const knowledgeRows = searchKnowledge(db, parsed.query, candidateLimit);
     knowledgeScored = knowledgeRows.map((row) => ({
       id: `knowledge:${row.path}:${row.startLine}`,
       text: `[${row.path}:${row.startLine}-${row.endLine}]\n${row.snippet}`,
@@ -131,6 +187,11 @@ export function memorySearch(input: unknown) {
   }
 
   const scored = [...dbScored, ...historyScored, ...knowledgeScored]
+    .map((row) => {
+      const source = row.category === "knowledge" ? "knowledge" : row.category === "other" ? "history" : "memory";
+      const boost = importanceScore(row.text, row.category, source);
+      return { ...row, score: row.score + boost };
+    })
     .sort((a, b) => (b.score - a.score) || (b.createdAt - a.createdAt))
     .slice(0, parsed.limit)
     .map(({ createdAt, ...rest }) => rest);

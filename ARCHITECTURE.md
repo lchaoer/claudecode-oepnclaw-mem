@@ -79,8 +79,12 @@ CREATE TABLE memories (
   id         TEXT PRIMARY KEY,    -- UUID
   text       TEXT NOT NULL,       -- 记忆文本
   category   TEXT NOT NULL,       -- preference / fact / decision / entity / other
-  created_at INTEGER NOT NULL     -- 时间戳 (ms)
+  created_at INTEGER NOT NULL,    -- 时间戳 (ms)
+  hash       TEXT                -- sha256(text + category)
 );
+
+-- 去重约束
+CREATE UNIQUE INDEX idx_memories_hash ON memories(hash);
 
 -- FTS5 全文索引（通过触发器自动同步）
 CREATE VIRTUAL TABLE memories_fts
@@ -130,10 +134,12 @@ USING fts5(text, id UNINDEXED, file_path UNINDEXED, tokenize='unicode61');
 ```mermaid
 flowchart LR
     A["memory_store(text, category)"] --> B["Zod 校验"]
-    B --> C["生成 UUID"]
-    C --> D["INSERT INTO memories"]
-    D --> E["触发器同步到 FTS5"]
-    E --> F["返回 {id, createdAt}"]
+    B --> C["生成 UUID + hash"]
+    C --> D["INSERT OR IGNORE INTO memories"]
+    D --> E{是否重复?}
+    E -->|是| F["返回 action=duplicate"]
+    E -->|否| G["触发器同步到 FTS5"]
+    G --> H["返回 action=stored"]
 ```
 
 ### 4.2 memory_search — 搜索记忆
@@ -143,23 +149,24 @@ flowchart TD
     A["memory_search(query, limit)"] --> B["Zod 校验"]
 
     B --> C1["① 长期记忆检索"]
-    C1 --> C1a["FTS5 MATCH + bm25"]
+    C1 --> C1a["FTS5 MATCH + bm25 → TopK"]
     C1a --> C1b{有结果?}
-    C1b -->|否| C1c["LIKE 兜底 + 手动评分"]
+    C1b -->|否| C1c["LIKE 兜底 + 手动评分 → TopK"]
     C1b -->|是| MERGE
     C1c --> MERGE
 
     B --> C2["② 会话历史检索"]
     C2 --> C2a["读取 history.jsonl"]
-    C2a --> C2b["关键词评分"]
+    C2a --> C2b["关键词评分 → TopK"]
     C2b --> MERGE
 
     B --> C3["③ 知识库检索"]
     C3 --> C3a["syncKnowledgeIfNeeded()"]
-    C3a --> C3b["FTS5 MATCH + bm25"]
+    C3a --> C3b["FTS5 MATCH + bm25 → TopK"]
     C3b --> MERGE
 
-    MERGE["合并三个来源"] --> SORT["按 score 降序 + 时间降序"]
+    MERGE["合并候选"] --> RERANK["重要度加权重排"]
+    RERANK --> SORT["按 finalScore 降序 + 时间降序"]
     SORT --> TOP["取 Top N"]
     TOP --> OUT["返回 {results}"]
 ```
@@ -195,15 +202,25 @@ flowchart TD
 
 ### 5.1 评分与排序
 
-| 数据源 | 检索方式 | 评分方式 |
+| 数据源 | 检索方式 | 基础评分 |
 |--------|----------|----------|
 | 长期记忆 | FTS5 MATCH (LIKE 兜底) | `bm25()` 取反 / 手动评分 |
 | 会话历史 | 全量扫描 | `scoreText()` 关键词评分 |
 | 知识索引 | FTS5 MATCH | `bm25()` 取反 |
 
-三个来源的结果统一按 `score 降序 → createdAt 降序` 合并排序，取 Top N 返回。
+**重排策略**：
+- 每个来源先取 TopK 候选
+- `finalScore = baseScore + importanceBoost`
+- `importanceBoost` 由**来源权重 + 结构权重 + 类别权重**组成
+- 按 `finalScore` 降序 → `createdAt` 降序取 Top N
 
-### 5.2 FTS5 查询构造
+### 5.2 重要度加权
+
+- **来源权重**：memory > knowledge > history
+- **结构权重**：标题行（`^#`）、列表项（`^-`/`*`/`\d+\.`）、代码块（```）
+- **类别权重**：`decision`、`preference` 适度加权
+
+### 5.3 FTS5 查询构造
 
 ```
 原始 query: "API 配置方法"
