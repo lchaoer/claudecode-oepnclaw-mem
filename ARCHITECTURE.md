@@ -25,21 +25,31 @@ graph TB
         KNOW --> MDDIR["知识目录 (.md 文件)"]
     end
 
+    subgraph "可选组件"
+        WATCHER["fs.watch 文件监听"]
+        META["knowledge_meta 配置检测"]
+    end
+
+    WATCHER -.->|dirty 标记| KNOW
+    META -.->|配置变更触发全量重建| KNOW
+
     style LLM fill:#4a90d9,color:#fff
     style TOOLS fill:#7ed321,color:#fff
     style DB fill:#f5a623,color:#fff
     style HIST fill:#f5a623,color:#fff
     style KNOW fill:#f5a623,color:#fff
+    style WATCHER fill:#e0e0e0,stroke:#999
+    style META fill:#e0e0e0,stroke:#999
 ```
 
 ## 2. 源码结构
 
 ```
 src/
-├── server.ts       # MCP Server 入口，注册工具，启动 stdio 传输
+├── server.ts       # MCP Server 入口，注册工具，启动 stdio 传输，watcher 初始化
 ├── tools.ts        # 三个工具的业务逻辑（store / search / forget）
 ├── db.ts           # SQLite 初始化，建表 + FTS5 + 触发器 + 迁移
-├── knowledge.ts    # 知识索引：分块、增量同步、FTS5 搜索
+├── knowledge.ts    # 知识索引：分块、增量同步、meta、watcher、FTS5 搜索
 ├── history.ts      # 读取 Claude Code history.jsonl
 ├── validators.ts   # Zod schema 校验
 ├── config.ts       # 环境变量配置
@@ -117,7 +127,20 @@ CREATE TABLE knowledge_chunks (
 -- FTS5 全文索引
 CREATE VIRTUAL TABLE knowledge_chunks_fts
 USING fts5(text, id UNINDEXED, file_path UNINDEXED, tokenize='unicode61');
+
+-- 索引元数据（配置变更检测）
+CREATE TABLE knowledge_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 ```
+
+**knowledge_meta 存储项**：
+
+| key | 说明 |
+|-----|------|
+| `chunk_config` | 分块参数签名（tokens/overlap/version），变更时触发全量重建 |
+| `last_sync` | 上次同步时间戳 |
 
 ### 3.3 会话历史（第 1 层）
 
@@ -185,18 +208,59 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    START["启动 / 搜索前触发"] --> CHECK{KNOWLEDGE_PATH 非空?}
+    START["启动 / 搜索前触发"] --> META{chunk 配置变更?}
+    META -->|是| FULL["全量重建（清库 + 重新分块 + 索引）"]
+    META -->|否| CHECK{KNOWLEDGE_PATH 非空?}
+
     CHECK -->|否| SKIP["跳过"]
-    CHECK -->|是| SCAN["递归扫描 .md 文件"]
-    SCAN --> COMPARE["对比 DB 中 knowledge_files 的 hash"]
+    CHECK -->|是| DIRTY{watcher dirty<br/>或 文件变更?}
+
+    DIRTY -->|否| SKIP2["跳过（冷却期内）"]
+    DIRTY -->|是| SCAN["递归扫描 .md 文件"]
+
+    SCAN --> COMPARE["mtime 变化 → 计算 hash 对比"]
     COMPARE --> CHANGED{hash 变化?}
     CHANGED -->|否| NEXT["跳过该文件"]
     CHANGED -->|是| DELETE["删除旧 chunks + FTS"]
-    DELETE --> CHUNK["重新分块（800字符/块，160重叠）"]
+    DELETE --> CHUNK["重新分块（近似 token：400/80）"]
     CHUNK --> INSERT["插入新 chunks + FTS"]
     INSERT --> NEXT
     NEXT --> CLEAN["清理磁盘已删除的文件记录"]
+    CLEAN --> SAVEMETA["更新 knowledge_meta"]
+
+    FULL --> SCAN
 ```
+
+### 4.5 分块策略
+
+```mermaid
+flowchart LR
+    A[".md 文件内容"] --> B["按行遍历"]
+    B --> C["approxTokenCount 估算 token"]
+    C --> D{累计 > CHUNK_TOKENS?}
+    D -->|否| E["继续累加"]
+    D -->|是| F["flush 当前块"]
+    F --> G["保留尾部 overlap"]
+    G --> B
+```
+
+**近似 token 估算**：
+- ASCII 字符：每 4 字符 ≈ 1 token
+- 非 ASCII 字符（中文等）：每字符 ≈ 1 token
+
+### 4.6 文件监听（可选）
+
+```mermaid
+flowchart LR
+    A["fs.watch(KNOWLEDGE_PATH)"] --> B["文件变更事件"]
+    B --> C["防抖 1.5s"]
+    C --> D["标记 knowledgeDirty = true"]
+    D --> E["下次 syncKnowledgeIfNeeded 时触发同步"]
+```
+
+- 通过 `MCP_MEMORY_WATCH=true` 启用
+- 使用 Node.js 原生 `fs.watch`（recursive 模式）
+- 防抖避免频繁触发
 
 ## 5. 检索策略
 
@@ -217,7 +281,7 @@ flowchart TD
 ### 5.2 重要度加权
 
 - **来源权重**：memory > knowledge > history
-- **结构权重**：标题行（`^#`）、列表项（`^-`/`*`/`\d+\.`）、代码块（```）
+- **结构权重**：标题行（`^#`）、列表项（`^-`/`*`/`\d+\.`）、代码块（` ``` `）
 - **类别权重**：`decision`、`preference` 适度加权
 
 ### 5.3 FTS5 查询构造
@@ -245,11 +309,19 @@ sequenceDiagram
     Main->>DB: import getDb() (触发模块初始化)
     DB->>DB: 建 memories 表 + FTS5 + 触发器
     DB->>DB: FTS 迁移（灌入已有数据）
+    DB->>DB: hash 列迁移（旧库兼容）
     DB->>Knowledge: initKnowledgeSchema() (如 KNOWLEDGE_PATH 非空)
-    Knowledge->>DB: 建 knowledge_files / knowledge_chunks / FTS5 表
+    Knowledge->>DB: 建 knowledge_files / knowledge_chunks / FTS5 / meta 表
 
-    Main->>Knowledge: syncKnowledge() (如 KNOWLEDGE_PATH 非空)
-    Knowledge->>Knowledge: 扫描 .md → 分块 → 入库
+    alt SYNC_ON_START = true
+        Main->>Knowledge: syncKnowledge() (全量同步)
+        Knowledge->>Knowledge: 扫描 .md → 近似 token 分块 → 入库
+    end
+
+    alt WATCH_ENABLED = true
+        Main->>Knowledge: initKnowledgeWatcher()
+        Knowledge->>Knowledge: fs.watch + 防抖 → dirty 标记
+    end
 
     Main->>MCP: server.connect(StdioServerTransport)
     MCP-->>Main: 等待 Claude Code 连接
@@ -264,6 +336,12 @@ sequenceDiagram
 | `MCP_MEMORY_KNOWLEDGE_PATH` | （空） | 知识目录，为空则不启用知识索引 |
 | `MCP_MEMORY_DEFAULT_LIMIT` | `5` | 默认搜索结果数 |
 | `MCP_MEMORY_MAX_LIMIT` | `20` | 最大搜索结果数 |
+| `MCP_MEMORY_CHUNK_TOKENS` | `400` | 知识索引分块大小（近似 token） |
+| `MCP_MEMORY_CHUNK_OVERLAP_TOKENS` | `80` | 分块重叠大小（近似 token） |
+| `MCP_MEMORY_SYNC_COOLDOWN_MS` | `5000` | 搜索前增量同步冷却时间（ms） |
+| `MCP_MEMORY_SYNC_ON_START` | `true` | 启动时是否全量同步知识索引 |
+| `MCP_MEMORY_WATCH` | `false` | 是否启用知识目录文件监听 |
+| `MCP_MEMORY_WATCH_DEBOUNCE_MS` | `1500` | 文件监听防抖时间（ms） |
 
 ## 8. 三层记忆体系
 
@@ -276,7 +354,7 @@ graph TD
 
     subgraph "第 2 层：知识索引"
         L2["知识目录 .md 文件"]
-        L2D["自动分块 + FTS5 索引<br/>增量同步 (SHA-256 hash)"]
+        L2D["近似 token 分块 + FTS5 索引<br/>增量同步 (hash/mtime) + watcher"]
     end
 
     subgraph "第 3 层：长期记忆"
@@ -284,7 +362,7 @@ graph TD
         L3D["memory_store 写入<br/>FTS5 + 触发器同步"]
     end
 
-    L1 --> SEARCH["memory_search<br/>三源合并排序"]
+    L1 --> SEARCH["memory_search<br/>三源合并 + 重要度重排"]
     L2 --> SEARCH
     L3 --> SEARCH
 
@@ -297,5 +375,19 @@ graph TD
 | 层级 | 数据来源 | 写入方式 | 索引方式 | 特点 |
 |------|----------|----------|----------|------|
 | 第 1 层 | `history.jsonl` | Claude Code 自动 | 全量扫描 + 关键词评分 | 零配置，低精度 |
-| 第 2 层 | 知识目录 `.md` | 用户手动放文件 | FTS5 分块索引 | 高精度，需维护文件 |
+| 第 2 层 | 知识目录 `.md` | 用户手动放文件 | FTS5 分块索引（近似 token） | 高精度，需维护文件 |
 | 第 3 层 | `memory_store` | Claude Code 调用 / 用户触发 | FTS5 + 触发器 | 精准，CLAUDE.md 驱动 |
+
+## 9. 与 OpenClaw 第二层的差异
+
+| 能力 | 本项目 | OpenClaw | 差异原因 |
+|------|--------|----------|----------|
+| 分块策略 | 近似 token（400/80） | 精确 token（400/80） | 轻量实现，免外部依赖 |
+| 索引方式 | FTS5 BM25 | FTS5 + 向量混合 | 不引入嵌入模型 |
+| 语义召回 | 无（仅关键词） | 有（向量嵌入） | 不引入嵌入模型 |
+| 会话数据源 | history.jsonl | sessions JSONL 分块索引 | 复用 Claude Code 原生 |
+| 增量同步 | hash/mtime + meta | hash/mtime | 基本对齐 |
+| 配置变更重建 | knowledge_meta 检测 | meta 表检测 | 基本对齐 |
+| 文件监听 | fs.watch（可选） | chokidar + 防抖 | 免外部依赖 |
+| 安全重建 | 事务内全量清除+重建 | 临时库 → 原子交换 | 知识索引与主库共用同一 SQLite |
+| 嵌入缓存 | 无 | embedding_cache | 无向量则无需缓存 |

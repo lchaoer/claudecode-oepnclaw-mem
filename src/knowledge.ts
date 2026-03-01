@@ -2,15 +2,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { KNOWLEDGE_PATH } from "./config.js";
-
-// 分块参数
-const MAX_CHARS = 800;
-const OVERLAP_CHARS = 160;
+import {
+  CHUNK_OVERLAP_TOKENS,
+  CHUNK_TOKENS,
+  KNOWLEDGE_PATH,
+  SYNC_COOLDOWN_MS,
+  WATCH_DEBOUNCE_MS,
+  WATCH_ENABLED,
+} from "./config.js";
 
 // 搜索前同步冷却
-const SYNC_COOLDOWN_MS = 5000;
 let lastSyncTime = 0;
+let knowledgeDirty = false;
 
 type ChunkResult = {
   text: string;
@@ -50,6 +53,11 @@ export function initKnowledgeSchema(db: Database.Database): void {
 
     CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts
     USING fts5(text, id UNINDEXED, file_path UNINDEXED, tokenize='unicode61');
+
+    CREATE TABLE IF NOT EXISTS knowledge_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 }
 
@@ -87,13 +95,22 @@ function listMdFiles(dir: string, base?: string): FileInfo[] {
 
 // ============ 分块 ============
 
+function approxTokenCount(text: string): number {
+  if (text.length === 0) return 0;
+  const asciiCount = (text.match(/[\x00-\x7F]/g) ?? []).length;
+  const nonAsciiCount = text.length - asciiCount;
+  const asciiTokens = Math.ceil(asciiCount / 4);
+  const nonAsciiTokens = nonAsciiCount;
+  return Math.max(1, asciiTokens + nonAsciiTokens);
+}
+
 export function chunkMarkdown(content: string): ChunkResult[] {
   const lines = content.split("\n");
   if (lines.length === 0) return [];
 
   const chunks: ChunkResult[] = [];
   let current: { line: string; lineNo: number }[] = [];
-  let currentChars = 0;
+  let currentTokens = 0;
 
   function flush() {
     if (current.length === 0) return;
@@ -107,31 +124,31 @@ export function chunkMarkdown(content: string): ChunkResult[] {
   }
 
   function carryOverlap() {
-    if (OVERLAP_CHARS <= 0 || current.length === 0) {
+    if (CHUNK_OVERLAP_TOKENS <= 0 || current.length === 0) {
       current = [];
-      currentChars = 0;
+      currentTokens = 0;
       return;
     }
     let acc = 0;
     const kept: typeof current = [];
     for (let i = current.length - 1; i >= 0; i--) {
-      acc += current[i].line.length + 1;
+      acc += approxTokenCount(current[i].line) + 1;
       kept.unshift(current[i]);
-      if (acc >= OVERLAP_CHARS) break;
+      if (acc >= CHUNK_OVERLAP_TOKENS) break;
     }
     current = kept;
-    currentChars = kept.reduce((s, e) => s + e.line.length + 1, 0);
+    currentTokens = kept.reduce((s, e) => s + approxTokenCount(e.line) + 1, 0);
   }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? "";
-    const lineSize = line.length + 1;
-    if (currentChars + lineSize > MAX_CHARS && current.length > 0) {
+    const lineTokens = approxTokenCount(line) + 1;
+    if (currentTokens + lineTokens > CHUNK_TOKENS && current.length > 0) {
       flush();
       carryOverlap();
     }
     current.push({ line, lineNo: i + 1 });
-    currentChars += lineSize;
+    currentTokens += lineTokens;
   }
   flush();
   return chunks;
@@ -139,9 +156,26 @@ export function chunkMarkdown(content: string): ChunkResult[] {
 
 // ============ 增量同步 ============
 
-export function syncKnowledge(db: Database.Database): void {
+function getMeta(db: Database.Database, key: string): string | null {
+  const row = db.prepare("SELECT value FROM knowledge_meta WHERE key = ?").get(key) as { value?: string } | undefined;
+  return row?.value ?? null;
+}
+
+function setMeta(db: Database.Database, key: string, value: string): void {
+  db.prepare("INSERT OR REPLACE INTO knowledge_meta (key, value) VALUES (?, ?)").run(key, value);
+}
+
+function chunkConfigSignature(): string {
+  return JSON.stringify({ tokens: CHUNK_TOKENS, overlap: CHUNK_OVERLAP_TOKENS, version: 1 });
+}
+
+export function syncKnowledge(
+  db: Database.Database,
+  options?: { fullReindex?: boolean },
+): void {
   if (!KNOWLEDGE_PATH) return;
 
+  const fullReindex = options?.fullReindex ?? false;
   const files = listMdFiles(KNOWLEDGE_PATH);
   const diskPaths = new Set(files.map((f) => f.relativePath));
 
@@ -157,6 +191,9 @@ export function syncKnowledge(db: Database.Database): void {
   const deleteFileChunks = db.prepare("DELETE FROM knowledge_chunks WHERE file_path = ?");
   const deleteFileFts = db.prepare("DELETE FROM knowledge_chunks_fts WHERE file_path = ?");
   const deleteFile = db.prepare("DELETE FROM knowledge_files WHERE path = ?");
+  const clearChunks = db.prepare("DELETE FROM knowledge_chunks");
+  const clearFts = db.prepare("DELETE FROM knowledge_chunks_fts");
+  const clearFiles = db.prepare("DELETE FROM knowledge_files");
   const insertChunk = db.prepare(
     "INSERT INTO knowledge_chunks (id, file_path, text, start_line, end_line, hash, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
@@ -165,17 +202,25 @@ export function syncKnowledge(db: Database.Database): void {
   );
 
   const syncAll = db.transaction(() => {
+    if (fullReindex) {
+      clearChunks.run();
+      clearFts.run();
+      clearFiles.run();
+    }
+
     for (const file of files) {
       const content = fs.readFileSync(file.absolutePath, "utf-8");
       const fileHash = hashContent(content);
       const existing = dbMap.get(file.relativePath);
 
       // hash 相同，跳过
-      if (existing && existing.hash === fileHash) continue;
+      if (!fullReindex && existing && existing.hash === fileHash) continue;
 
-      // 删除旧 chunks + FTS
-      deleteFileChunks.run(file.relativePath);
-      deleteFileFts.run(file.relativePath);
+      if (!fullReindex) {
+        // 删除旧 chunks + FTS
+        deleteFileChunks.run(file.relativePath);
+        deleteFileFts.run(file.relativePath);
+      }
 
       // 分块并插入
       const chunks = chunkMarkdown(content);
@@ -191,13 +236,18 @@ export function syncKnowledge(db: Database.Database): void {
     }
 
     // 清理已删除的文件
-    for (const dbFile of dbFiles) {
-      if (!diskPaths.has(dbFile.path)) {
-        deleteFileChunks.run(dbFile.path);
-        deleteFileFts.run(dbFile.path);
-        deleteFile.run(dbFile.path);
+    if (!fullReindex) {
+      for (const dbFile of dbFiles) {
+        if (!diskPaths.has(dbFile.path)) {
+          deleteFileChunks.run(dbFile.path);
+          deleteFileFts.run(dbFile.path);
+          deleteFile.run(dbFile.path);
+        }
       }
     }
+
+    setMeta(db, "chunk_config", chunkConfigSignature());
+    setMeta(db, "last_sync", String(Date.now()));
   });
 
   syncAll();
@@ -211,19 +261,30 @@ function hasKnowledgeChanges(db: Database.Database): boolean {
 
   const files = listMdFiles(KNOWLEDGE_PATH);
   const dbFiles = db
-    .prepare("SELECT path, mtime FROM knowledge_files")
-    .all() as Array<{ path: string; mtime: number }>;
-  const dbMap = new Map(dbFiles.map((f) => [f.path, f.mtime]));
+    .prepare("SELECT path, hash, mtime FROM knowledge_files")
+    .all() as Array<{ path: string; hash: string; mtime: number }>;
+  const dbMap = new Map(dbFiles.map((f) => [f.path, f]));
 
   // 文件数量不同
   if (files.length !== dbMap.size) return true;
 
-  // 逐个比较 mtime
+  // mtime 变化时再计算 hash
   for (const file of files) {
-    const dbMtime = dbMap.get(file.relativePath);
-    if (dbMtime === undefined || dbMtime !== file.mtime) return true;
+    const dbFile = dbMap.get(file.relativePath);
+    if (!dbFile || dbFile.mtime !== file.mtime) {
+      const content = fs.readFileSync(file.absolutePath, "utf-8");
+      const fileHash = hashContent(content);
+      if (!dbFile || dbFile.hash !== fileHash) return true;
+    }
   }
+
   return false;
+}
+
+function needsFullReindex(db: Database.Database): boolean {
+  const current = chunkConfigSignature();
+  const stored = getMeta(db, "chunk_config");
+  return stored !== current;
 }
 
 export function syncKnowledgeIfNeeded(db: Database.Database): void {
@@ -231,8 +292,15 @@ export function syncKnowledgeIfNeeded(db: Database.Database): void {
   const now = Date.now();
   if (now - lastSyncTime < SYNC_COOLDOWN_MS) return;
   lastSyncTime = now;
-  if (hasKnowledgeChanges(db)) {
+
+  if (needsFullReindex(db)) {
+    syncKnowledge(db, { fullReindex: true });
+    return;
+  }
+
+  if (knowledgeDirty || hasKnowledgeChanges(db)) {
     syncKnowledge(db);
+    knowledgeDirty = false;
   }
 }
 
@@ -291,4 +359,31 @@ export function searchKnowledge(
     score: -row.rank,
     updatedAt: row.updated_at,
   }));
+}
+
+export function markKnowledgeDirty(): void {
+  knowledgeDirty = true;
+}
+
+let debounceTimer: NodeJS.Timeout | null = null;
+
+export function initKnowledgeWatcher(): (() => void) | null {
+  if (!WATCH_ENABLED || !KNOWLEDGE_PATH) return null;
+
+  const fsWatcher = fs.watch(
+    KNOWLEDGE_PATH,
+    { recursive: true },
+    () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        markKnowledgeDirty();
+      }, WATCH_DEBOUNCE_MS);
+    },
+  );
+
+  return () => fsWatcher.close();
+}
+
+export function needsSafeReindex(db: Database.Database): boolean {
+  return needsFullReindex(db);
 }

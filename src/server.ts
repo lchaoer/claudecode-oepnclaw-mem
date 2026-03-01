@@ -2,9 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { memoryForget, memorySearch, memoryStore } from "./tools.js";
-import { KNOWLEDGE_PATH } from "./config.js";
+import { KNOWLEDGE_PATH, SYNC_ON_START } from "./config.js";
 import { getDb } from "./db.js";
-import { syncKnowledge } from "./knowledge.js";
+import { initKnowledgeWatcher, syncKnowledge } from "./knowledge.js";
 
 const server = new McpServer({
   name: "claudecode-oepnclaw-mem",
@@ -72,11 +72,22 @@ server.registerTool(
 
 async function main() {
   // 启动时首次同步知识索引
-  if (KNOWLEDGE_PATH) {
+  if (KNOWLEDGE_PATH && SYNC_ON_START) {
     syncKnowledge(getDb());
   }
+
+  // 可选 watcher
+  let stopWatcher: (() => void) | null = null;
+  if (KNOWLEDGE_PATH) {
+    stopWatcher = initKnowledgeWatcher();
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  if (stopWatcher) {
+    process.on("exit", () => stopWatcher?.());
+  }
 }
 
 main().catch((error) => {
