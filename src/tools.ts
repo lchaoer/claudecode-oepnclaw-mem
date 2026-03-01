@@ -125,7 +125,7 @@ export function memorySearch(input: unknown) {
     .split(/\s+/)
     .filter((t) => t.length > 0);
 
-  let dbScored: Array<MemorySearchResult & { createdAt: number }> = [];
+  let dbScored: Array<Omit<MemorySearchResult, "createdAt"> & { createdAt: number }> = [];
   const candidateLimit = Math.min(parsed.limit * CANDIDATE_MULTIPLIER, CANDIDATE_MAX);
 
   if (tokens.length > 0) {
@@ -175,7 +175,7 @@ export function memorySearch(input: unknown) {
       .slice(0, candidateLimit);
   }
 
-  const historyScored: Array<MemorySearchResult & { createdAt: number }> = readHistoryEntries()
+  const historyScored: Array<Omit<MemorySearchResult, "createdAt"> & { createdAt: number }> = readHistoryEntries()
     .map((entry) => {
       const text = entry.display ?? "";
       return {
@@ -191,7 +191,7 @@ export function memorySearch(input: unknown) {
     .slice(0, candidateLimit);
 
   // 知识库检索
-  let knowledgeScored: Array<MemorySearchResult & { createdAt: number }> = [];
+  let knowledgeScored: Array<Omit<MemorySearchResult, "createdAt"> & { createdAt: number }> = [];
   if (KNOWLEDGE_PATH) {
     syncKnowledgeIfNeeded(db);
     const knowledgeRows = searchKnowledge(db, parsed.query, candidateLimit);
@@ -205,7 +205,7 @@ export function memorySearch(input: unknown) {
   }
 
   // 会话历史检索
-  let sessionScored: Array<MemorySearchResult & { createdAt: number }> = [];
+  let sessionScored: Array<Omit<MemorySearchResult, "createdAt"> & { createdAt: number }> = [];
   if (SESSIONS_PATH) {
     syncSessionsIfNeeded(db);
     const sessionRows = searchSessions(db, parsed.query, candidateLimit);
@@ -220,7 +220,7 @@ export function memorySearch(input: unknown) {
         text: header ? `[${header}]\n${row.snippet}` : row.snippet,
         category: "session" as const,
         score: row.score,
-        createdAt: row.updatedAt,
+        createdAt: row.endTime || row.startTime || row.updatedAt,
       };
     });
   }
@@ -236,7 +236,10 @@ export function memorySearch(input: unknown) {
     })
     .sort((a, b) => (b.score - a.score) || (b.createdAt - a.createdAt))
     .slice(0, parsed.limit)
-    .map(({ createdAt, ...rest }) => rest);
+    .map(({ createdAt, ...rest }) => ({
+      ...rest,
+      createdAt: createdAt ? new Date(createdAt).toISOString().slice(0, 16).replace("T", " ") : undefined,
+    }));
 
   return { results: scored };
 }

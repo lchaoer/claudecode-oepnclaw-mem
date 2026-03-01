@@ -12,6 +12,7 @@ export type MemorySearchResult = {
   text: string;
   category: MemoryCategory;
   score: number;
+  createdAt?: string;
 };
 
 export type MessageRole = "user" | "assistant";
