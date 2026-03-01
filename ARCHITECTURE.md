@@ -1,6 +1,6 @@
 # MCP 记忆服务架构文档
 
-> `claudecode-oepnclaw-mem` — 为 Claude Code 提供跨会话长期记忆的 MCP Server。
+> `claudecode-infinite-memory` — 为 Claude Code 提供跨会话长期记忆的 MCP Server。
 
 ## 1. 整体架构
 
@@ -11,7 +11,7 @@ graph TB
         LLM -->|MCP stdio| CLIENT["MCP Client"]
     end
 
-    subgraph "MCP Server (claudecode-oepnclaw-mem)"
+    subgraph "MCP Server (claudecode-infinite-memory)"
         CLIENT --> TOOLS["工具层<br/>memory_store / memory_search / memory_forget"]
 
         TOOLS --> DB["长期记忆<br/>SQLite memories + FTS5"]

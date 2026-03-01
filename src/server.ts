@@ -8,7 +8,7 @@ import { initKnowledgeWatcher, syncKnowledge } from "./knowledge.js";
 import { syncSessions } from "./sessions.js";
 
 const server = new McpServer({
-  name: "claudecode-oepnclaw-mem",
+  name: "claudecode-infinite-memory",
   version: "0.1.0",
 });
 

@@ -1,4 +1,4 @@
-# claudecode-oepnclaw-mem
+# claudecode-infinite-memory
 
 > 基于 SQLite + FTS5 全文检索的 MCP 记忆服务（stdio），支持长期记忆、会话历史、知识索引三源合并检索。
 
@@ -98,11 +98,11 @@ npm start
 ```json
 {
   "mcpServers": {
-    "claudecode-oepnclaw-mem": {
+    "claudecode-infinite-memory": {
       "command": "npm",
-      "args": ["--prefix", "D:/dev/cc/claudecode-oepnclaw-mem", "run", "-s", "dev"],
+      "args": ["--prefix", "D:/dev/cc/claudecode-infinite-memory", "run", "-s", "dev"],
       "env": {
-        "MCP_MEMORY_DB_PATH": "D:/dev/cc/claudecode-oepnclaw-mem/memory.sqlite",
+        "MCP_MEMORY_DB_PATH": "D:/dev/cc/claudecode-infinite-memory/memory.sqlite",
         "MCP_MEMORY_DEFAULT_LIMIT": "5",
         "MCP_MEMORY_MAX_LIMIT": "20",
         "MCP_MEMORY_CLAUDE_HISTORY_PATH": "C:/Users/13357/.claude/history.jsonl",
@@ -121,6 +121,6 @@ npm start
 如果你安装了 `mcporter`：
 
 ```bash
-mcporter call --stdio "npm --prefix D:/dev/cc/claudecode-oepnclaw-mem run -s dev" memory_store text="用户偏好中文回复" category=preference
-mcporter call --stdio "npm --prefix D:/dev/cc/claudecode-oepnclaw-mem run -s dev" memory_search query="中文回复" limit=5
+mcporter call --stdio "npm --prefix D:/dev/cc/claudecode-infinite-memory run -s dev" memory_store text="用户偏好中文回复" category=preference
+mcporter call --stdio "npm --prefix D:/dev/cc/claudecode-infinite-memory run -s dev" memory_search query="中文回复" limit=5
 ```

@@ -110,7 +110,7 @@ function listSessionFiles(dir: string): FileInfo[] {
   for (const entry of entries) {
     const abs = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      // 递归进子目录（如 d--dev-clawdbot-openclaw/）
+      // 递归进子目录
       results.push(...listSessionFiles(abs));
     } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
       const stat = fs.statSync(abs);
