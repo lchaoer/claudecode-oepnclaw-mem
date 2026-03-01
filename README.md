@@ -1,112 +1,80 @@
 # claudecode-infinite-memory
 
-> 基于 SQLite + FTS5 全文检索的 MCP 记忆服务（stdio），支持长期记忆、会话历史、知识索引三源合并检索。
+> A lightweight MCP memory server built on SQLite + FTS5, providing cross-session long-term memory for Claude Code. Supports three-source merged retrieval: long-term memories, session history, and knowledge base indexing.
 
-## 1. 运行环境
+## Features
 
-- Node.js 18+（建议 20+）
-- 已在本项目执行过 `npm install`
+- **Long-term memory** — Store and retrieve persistent memories across sessions with deduplication
+- **Session indexing** — Automatically indexes Claude Code session transcripts (user + assistant messages)
+- **Knowledge base** — Drop `.md` files in a folder and get them auto-indexed with FTS5
+- **Three-source search** — Queries all three sources simultaneously with importance-weighted re-ranking
+- **Incremental sync** — Only re-indexes files that actually changed (hash + mtime detection)
+- **Zero external model dependencies** — Pure keyword-based retrieval using FTS5 BM25, no embedding models needed
 
-## 2. 本地运行（stdio）
+## How It Works
 
-```bash
-npm run dev
+```mermaid
+graph BT
+    subgraph Data Sources
+        CC["Claude Code Sessions\nauto-generated .jsonl"]
+        MD["Knowledge Files\nuser-managed .md"]
+        STORE["memory_store() calls\nfrom Claude Code"]
+    end
+
+    subgraph Index & Storage
+        SESS["Layer 1: session_chunks\nFTS5 indexed"]
+        KNOW["Layer 2: knowledge_chunks\nFTS5 indexed"]
+        MEM["Layer 3: memories\nFTS5 indexed"]
+    end
+
+    CC -->|auto sync| SESS
+    MD -->|auto sync| KNOW
+    STORE -->|store + dedup| MEM
+
+    SESS --> SEARCH["memory_search(query)"]
+    KNOW --> SEARCH
+    MEM --> SEARCH
+
+    subgraph Claude Code Client
+        USER["User Input"] --> LLM["Claude LLM"]
+    end
+
+    SEARCH -->|results| LLM
 ```
 
-这会启动 MCP server（stdio 模式），用于 Claude Code 连接。
+## Requirements
 
-如需生成产物：
+- Node.js 18+ (20+ recommended)
+- Run `npm install` in the project directory
+
+## Quick Start
 
 ```bash
+# Development mode (stdio)
+npm run dev
+
+# Production build
 npm run build
 npm start
 ```
 
-## 3. 环境变量
+## Integration with Claude Code
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MCP_MEMORY_DB_PATH` | `./memory.sqlite` | SQLite 数据库路径 |
-| `MCP_MEMORY_CLAUDE_HISTORY_PATH` | `C:/Users/13357/.claude/history.jsonl` | Claude Code 会话历史文件路径 |
-| `MCP_MEMORY_KNOWLEDGE_PATH` | （空，不启用） | 知识目录路径，放入 `.md` 文件自动索引 |
-| `MCP_MEMORY_DEFAULT_LIMIT` | `5` | 默认搜索结果数 |
-| `MCP_MEMORY_MAX_LIMIT` | `20` | 最大搜索结果数 |
-| `MCP_MEMORY_CHUNK_TOKENS` | `400` | 知识索引分块大小（近似 token） |
-| `MCP_MEMORY_CHUNK_OVERLAP_TOKENS` | `80` | 分块重叠大小（近似 token） |
-| `MCP_MEMORY_SYNC_COOLDOWN_MS` | `5000` | 搜索前增量同步冷却时间（ms） |
-| `MCP_MEMORY_SYNC_ON_START` | `true` | 启动时是否全量同步知识索引 |
-| `MCP_MEMORY_WATCH` | `false` | 是否启用知识目录文件监听 |
-| `MCP_MEMORY_WATCH_DEBOUNCE_MS` | `1500` | 文件监听防抖时间（ms） |
-
-## 4. 工具接口
-
-- `memory_store(text, category?)` — 写入一条长期记忆（带去重）
-- `memory_search(query, limit?)` — 搜索记忆（合并三个数据源）
-- `memory_forget(id)` — 删除一条记忆
-
-### 4.0 memory_store 去重说明
-
-- 使用 `sha256(text + category)` 作为唯一 hash
-- SQLite `UNIQUE(hash)` 强制去重
-- 重复写入返回 `action: "duplicate"`（成功则 `action: "stored"`）
-
-### 4.1 memory_search 数据源
-
-`memory_search` 会从三个来源检索并合并排序：
-
-1. **长期记忆（memories）**：FTS5 全文检索 + bm25 排名，LIKE 兜底
-2. **会话历史（history.jsonl）**：关键词评分匹配用户历史 prompt
-3. **知识索引（knowledge_chunks）**：对知识目录 `.md` 文件分块后的 FTS5 检索
-
-**排序策略**：
-- 先对每个来源取 **TopK** 候选（`limit * 5`，上限 50）
-- 再统一重排：`score + 重要度加权`（来源权重 + 结构权重 + 类别权重）
-- 按 `finalScore` 降序 + 时间降序取 Top N
-
-## 5. 知识索引功能（第二层记忆）
-
-设置 `MCP_MEMORY_KNOWLEDGE_PATH` 指向一个目录，往里面放 `.md` 文件即可。
-
-**工作原理**：
-- **启动时**：全量扫描目录 → 近似 token 分块（默认 400 token/块，80 token 重叠）→ 建 FTS5 索引
-- **搜索时**：冷却期 + 变更检测 → 有变化时增量重建
-- **增量同步**：mtime 变更触发 hash 校验，只重建变化文件的 chunks
-- **删除同步**：磁盘上不存在的文件自动清理对应 chunks
-- **配置变更重建**：修改 chunk 参数后自动触发全量重建（通过 `knowledge_meta` 检测）
-- **文件监听（可选）**：设置 `MCP_MEMORY_WATCH=true` 启用 fs.watch，1.5s 防抖后标记 dirty
-
-**不设置 `MCP_MEMORY_KNOWLEDGE_PATH` 时**，该功能完全静默跳过，不影响现有功能。
-
-### 5.1 与 OpenClaw 第二层的差异
-
-| 能力 | 本项目 | OpenClaw |
-|------|--------|----------|
-| 分块策略 | 近似 token（400/80） | 精确 token（400/80） |
-| 索引方式 | FTS5 BM25 | FTS5 + 向量混合 |
-| 语义召回 | 无（仅关键词） | 有（向量嵌入） |
-| 会话数据源 | history.jsonl | sessions JSONL 分块索引 |
-| 增量同步 | hash/mtime | hash/mtime |
-| 文件监听 | fs.watch（可选） | chokidar + 防抖 |
-| 安全重建 | 事务内全量清除+重建 | 临时库 → 原子交换 |
-
-**差异原因**：本项目定位为轻量 MCP 实现，暂不引入向量嵌入与外部模型依赖。
-
-## 6. Claude Code 中使用
-
-在 Claude Code 的 MCP 配置（`~/.claude.json`）中新增一个 **stdio** 服务器：
+Add the following to your Claude Code MCP config (`~/.claude.json`):
 
 ```json
 {
   "mcpServers": {
     "claudecode-infinite-memory": {
       "command": "npm",
-      "args": ["--prefix", "D:/dev/cc/claudecode-infinite-memory", "run", "-s", "dev"],
+      "args": ["--prefix", "/path/to/claudecode-infinite-memory", "run", "-s", "dev"],
       "env": {
-        "MCP_MEMORY_DB_PATH": "D:/dev/cc/claudecode-infinite-memory/memory.sqlite",
+        "MCP_MEMORY_DB_PATH": "/path/to/claudecode-infinite-memory/memory.sqlite",
+        "MCP_MEMORY_CLAUDE_HISTORY_PATH": "~/.claude/history.jsonl",
+        "MCP_MEMORY_SESSIONS_PATH": "~/.claude/projects",
+        "MCP_MEMORY_KNOWLEDGE_PATH": "/path/to/your/knowledge-base",
         "MCP_MEMORY_DEFAULT_LIMIT": "5",
         "MCP_MEMORY_MAX_LIMIT": "20",
-        "MCP_MEMORY_CLAUDE_HISTORY_PATH": "C:/Users/13357/.claude/history.jsonl",
-        "MCP_MEMORY_KNOWLEDGE_PATH": "D:/dev/cc/knowledge-base",
         "MCP_MEMORY_WATCH": "false"
       }
     }
@@ -114,13 +82,74 @@ npm start
 }
 ```
 
-> 如果你用的是全局 Claude Code 配置，请把这段合并到你的 `mcpServers` 下。
+> Replace `/path/to/...` with your actual paths. Merge into your existing `mcpServers` if needed.
 
-## 7. 手动验证（可选）
+## Tools
 
-如果你安装了 `mcporter`：
+### `memory_store(text, category?)`
 
-```bash
-mcporter call --stdio "npm --prefix D:/dev/cc/claudecode-infinite-memory run -s dev" memory_store text="用户偏好中文回复" category=preference
-mcporter call --stdio "npm --prefix D:/dev/cc/claudecode-infinite-memory run -s dev" memory_search query="中文回复" limit=5
-```
+Store a long-term memory entry.
+
+- **`text`** (required) — The memory content
+- **`category`** (optional) — One of: `preference`, `fact`, `decision`, `entity`, `other`
+- **Deduplication** — Uses `sha256(text + category)` as a unique hash. Duplicate writes return `action: "duplicate"`, successful writes return `action: "stored"`.
+
+### `memory_search(query, limit?)`
+
+Search across all three data sources with merged ranking.
+
+**Data sources:**
+1. **Long-term memories** (`memories` table) — FTS5 full-text search with BM25 ranking, LIKE fallback
+2. **Session history** (session JSONL files) — FTS5 full-text search on indexed session transcripts
+3. **Knowledge base** (`knowledge_chunks` table) — FTS5 full-text search on chunked `.md` files
+
+**Ranking strategy:**
+- Each source produces TopK candidates (`limit * 5`, capped at 50)
+- Results are re-ranked: `finalScore = baseScore + importanceBoost`
+- Importance boost factors: source weight + structure weight + category weight
+- Final results sorted by `finalScore` desc, then `createdAt` desc
+
+### `memory_forget(id)`
+
+Delete a specific memory entry by ID. Returns `{ deleted: true | false }`.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_MEMORY_DB_PATH` | `./memory.sqlite` | SQLite database path |
+| `MCP_MEMORY_CLAUDE_HISTORY_PATH` | `~/.claude/history.jsonl` | Claude Code session history file |
+| `MCP_MEMORY_SESSIONS_PATH` | `~/.claude/projects` | Directory containing session JSONL files |
+| `MCP_MEMORY_KNOWLEDGE_PATH` | _(empty, disabled)_ | Knowledge directory path; put `.md` files here for auto-indexing |
+| `MCP_MEMORY_DEFAULT_LIMIT` | `5` | Default search result count |
+| `MCP_MEMORY_MAX_LIMIT` | `20` | Maximum search result count |
+| `MCP_MEMORY_CHUNK_TOKENS` | `400` | Knowledge indexing chunk size (approximate tokens) |
+| `MCP_MEMORY_CHUNK_OVERLAP_TOKENS` | `80` | Chunk overlap size (approximate tokens) |
+| `MCP_MEMORY_SYNC_COOLDOWN_MS` | `5000` | Cooldown before incremental sync on search (ms) |
+| `MCP_MEMORY_SYNC_ON_START` | `true` | Full sync on server startup |
+| `MCP_MEMORY_WATCH` | `false` | Enable file watcher for knowledge directory |
+| `MCP_MEMORY_WATCH_DEBOUNCE_MS` | `1500` | File watcher debounce interval (ms) |
+
+## Knowledge Base (Layer 2)
+
+Set `MCP_MEMORY_KNOWLEDGE_PATH` to a directory containing `.md` files.
+
+**How it works:**
+- **On startup** — Full scan, approximate token-based chunking (default 400 tokens/chunk, 80 overlap), FTS5 indexing
+- **On search** — Cooldown check + change detection, incremental rebuild if needed
+- **Incremental sync** — mtime change triggers hash comparison, only changed files are re-chunked
+- **Deletion sync** — Files removed from disk are automatically cleaned from the index
+- **Config change rebuild** — Changing chunk parameters triggers a full rebuild (detected via `knowledge_meta`)
+- **File watcher (optional)** — Set `MCP_MEMORY_WATCH=true` for `fs.watch`-based monitoring with debounce
+
+When `MCP_MEMORY_KNOWLEDGE_PATH` is not set, this feature is silently skipped.
+
+## Three-Layer Memory Architecture
+
+| Layer | Source | Write Method | Index Method | Characteristics |
+|-------|--------|-------------|-------------|-----------------|
+| Layer 1 | Session JSONL files | Auto (Claude Code) | FTS5 chunked index | Zero-config, session transcript search |
+| Layer 2 | Knowledge `.md` files | Manual (user drops files) | FTS5 chunked index (approx. tokens) | High precision, requires file maintenance |
+| Layer 3 | `memory_store` calls | Claude Code / user-triggered | FTS5 + triggers | Precise, driven by CLAUDE.md instructions |
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation.

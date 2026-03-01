@@ -1,62 +1,63 @@
-# MCP 记忆服务架构文档
+# Architecture Document
 
-> `claudecode-infinite-memory` — 为 Claude Code 提供跨会话长期记忆的 MCP Server。
+> `claudecode-infinite-memory` — An MCP Server providing cross-session long-term memory for Claude Code.
 
-## 1. 整体架构
+## 1. Overall Architecture
 
 ```mermaid
 graph TB
-    subgraph "Claude Code (客户端)"
-        U["用户输入"] --> LLM["Claude LLM"]
+    subgraph "Claude Code (Client)"
+        U["User Input"] --> LLM["Claude LLM"]
         LLM -->|MCP stdio| CLIENT["MCP Client"]
     end
 
     subgraph "MCP Server (claudecode-infinite-memory)"
-        CLIENT --> TOOLS["工具层<br/>memory_store / memory_search / memory_forget"]
+        CLIENT --> TOOLS["Tool Layer<br/>memory_store / memory_search / memory_forget"]
 
-        TOOLS --> DB["长期记忆<br/>SQLite memories + FTS5"]
-        TOOLS --> HIST["会话历史<br/>history.jsonl"]
-        TOOLS --> KNOW["知识索引<br/>knowledge_chunks + FTS5"]
+        TOOLS --> DB["Long-term Memory<br/>SQLite memories + FTS5"]
+        TOOLS --> SESS["Session Index<br/>session_chunks + FTS5"]
+        TOOLS --> KNOW["Knowledge Index<br/>knowledge_chunks + FTS5"]
     end
 
-    subgraph "外部存储"
+    subgraph "External Storage"
         DB --> SQLITE["memory.sqlite"]
-        HIST --> JSONL["~/.claude/history.jsonl"]
-        KNOW --> MDDIR["知识目录 (.md 文件)"]
+        SESS --> JSONL["~/.claude/projects/**/*.jsonl"]
+        KNOW --> MDDIR["Knowledge Directory (.md files)"]
     end
 
-    subgraph "可选组件"
-        WATCHER["fs.watch 文件监听"]
-        META["knowledge_meta 配置检测"]
+    subgraph "Optional Components"
+        WATCHER["fs.watch File Watcher"]
+        META["knowledge_meta Config Detection"]
     end
 
-    WATCHER -.->|dirty 标记| KNOW
-    META -.->|配置变更触发全量重建| KNOW
+    WATCHER -.->|dirty flag| KNOW
+    META -.->|config change triggers full rebuild| KNOW
 
     style LLM fill:#4a90d9,color:#fff
     style TOOLS fill:#7ed321,color:#fff
     style DB fill:#f5a623,color:#fff
-    style HIST fill:#f5a623,color:#fff
+    style SESS fill:#f5a623,color:#fff
     style KNOW fill:#f5a623,color:#fff
     style WATCHER fill:#e0e0e0,stroke:#999
     style META fill:#e0e0e0,stroke:#999
 ```
 
-## 2. 源码结构
+## 2. Source Structure
 
 ```
 src/
-├── server.ts       # MCP Server 入口，注册工具，启动 stdio 传输，watcher 初始化
-├── tools.ts        # 三个工具的业务逻辑（store / search / forget）
-├── db.ts           # SQLite 初始化，建表 + FTS5 + 触发器 + 迁移
-├── knowledge.ts    # 知识索引：分块、增量同步、meta、watcher、FTS5 搜索
-├── history.ts      # 读取 Claude Code history.jsonl
-├── validators.ts   # Zod schema 校验
-├── config.ts       # 环境变量配置
-└── types.ts        # TypeScript 类型定义
+├── server.ts       # MCP Server entry point — tool registration, stdio transport, watcher init
+├── tools.ts        # Core logic for memory_store / search / forget
+├── db.ts           # SQLite init — tables, FTS5, triggers, migrations
+├── knowledge.ts    # Knowledge indexing — chunking, incremental sync, meta, watcher, FTS5 search
+├── sessions.ts     # Session indexing — JSONL parsing, message extraction, chunking, FTS5 search
+├── history.ts      # Reads Claude Code history.jsonl (legacy Layer 1)
+├── validators.ts   # Zod schema validation
+├── config.ts       # Environment variable configuration
+└── types.ts        # TypeScript type definitions
 ```
 
-### 2.1 模块依赖关系
+### 2.1 Module Dependency Graph
 
 ```mermaid
 graph LR
@@ -64,305 +65,386 @@ graph LR
     SERVER --> CONFIG["config.ts"]
     SERVER --> DB["db.ts"]
     SERVER --> KNOWLEDGE["knowledge.ts"]
+    SERVER --> SESSIONS["sessions.ts"]
 
     TOOLS --> DB
     TOOLS --> HISTORY["history.ts"]
     TOOLS --> KNOWLEDGE
+    TOOLS --> SESSIONS
     TOOLS --> VALIDATORS["validators.ts"]
     TOOLS --> CONFIG
     TOOLS --> TYPES["types.ts"]
 
     DB --> CONFIG
     DB --> KNOWLEDGE
+    DB --> SESSIONS
     HISTORY --> CONFIG
     KNOWLEDGE --> CONFIG
+    SESSIONS --> CONFIG
     VALIDATORS --> CONFIG
 ```
 
-## 3. 数据模型
+## 3. Data Model
 
-### 3.1 长期记忆（第 3 层）
+### 3.1 Long-term Memory (Layer 3)
 
 ```sql
--- 主表
+-- Main table
 CREATE TABLE memories (
   id         TEXT PRIMARY KEY,    -- UUID
-  text       TEXT NOT NULL,       -- 记忆文本
+  text       TEXT NOT NULL,       -- Memory text
   category   TEXT NOT NULL,       -- preference / fact / decision / entity / other
-  created_at INTEGER NOT NULL,    -- 时间戳 (ms)
-  hash       TEXT                -- sha256(text + category)
+  created_at INTEGER NOT NULL,    -- Timestamp (ms)
+  hash       TEXT                 -- sha256(text + category)
 );
 
--- 去重约束
+-- Deduplication constraint
 CREATE UNIQUE INDEX idx_memories_hash ON memories(hash);
 
--- FTS5 全文索引（通过触发器自动同步）
+-- FTS5 full-text index (auto-synced via triggers)
 CREATE VIRTUAL TABLE memories_fts
 USING fts5(id UNINDEXED, text, category UNINDEXED,
            content=memories, content_rowid=rowid, tokenize='unicode61');
 ```
 
-### 3.2 知识索引（第 2 层）
+### 3.2 Knowledge Index (Layer 2)
 
 ```sql
--- 文件元数据（增量检测）
+-- File metadata (for incremental detection)
 CREATE TABLE knowledge_files (
-  path  TEXT PRIMARY KEY,    -- 相对于知识目录
+  path  TEXT PRIMARY KEY,    -- Relative to knowledge directory
   hash  TEXT NOT NULL,       -- SHA-256
   mtime INTEGER NOT NULL,
   size  INTEGER NOT NULL
 );
 
--- 分块内容
+-- Chunked content
 CREATE TABLE knowledge_chunks (
   id         TEXT PRIMARY KEY,   -- UUID
   file_path  TEXT NOT NULL,
-  text       TEXT NOT NULL,      -- 块内容
+  text       TEXT NOT NULL,      -- Chunk content
   start_line INTEGER NOT NULL,
   end_line   INTEGER NOT NULL,
   hash       TEXT NOT NULL,      -- SHA-256
   updated_at INTEGER NOT NULL
 );
 
--- FTS5 全文索引
+-- FTS5 full-text index
 CREATE VIRTUAL TABLE knowledge_chunks_fts
 USING fts5(text, id UNINDEXED, file_path UNINDEXED, tokenize='unicode61');
 
--- 索引元数据（配置变更检测）
+-- Index metadata (config change detection)
 CREATE TABLE knowledge_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 ```
 
-**knowledge_meta 存储项**：
+**`knowledge_meta` entries:**
 
-| key | 说明 |
-|-----|------|
-| `chunk_config` | 分块参数签名（tokens/overlap/version），变更时触发全量重建 |
-| `last_sync` | 上次同步时间戳 |
+| Key | Description |
+|-----|-------------|
+| `chunk_config` | Chunk parameter signature (tokens/overlap/version); triggers full rebuild on change |
+| `last_sync` | Last sync timestamp |
 
-### 3.3 会话历史（第 1 层）
+### 3.3 Session Index (Layer 1)
 
-不自建存储，直接读取 Claude Code 的 `~/.claude/history.jsonl`。每行一个 JSON 对象：
+```sql
+-- File metadata
+CREATE TABLE session_files (
+  path  TEXT PRIMARY KEY,
+  hash  TEXT NOT NULL,
+  mtime INTEGER NOT NULL,
+  size  INTEGER NOT NULL
+);
 
-```json
-{ "display": "用户的 prompt", "timestamp": 1708000000000, "project": "/path", "sessionId": "..." }
+-- Chunked session content
+CREATE TABLE session_chunks (
+  id         TEXT PRIMARY KEY,
+  file_path  TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  project    TEXT,
+  text       TEXT NOT NULL,
+  start_idx  INTEGER NOT NULL,
+  end_idx    INTEGER NOT NULL,
+  hash       TEXT NOT NULL,
+  start_time INTEGER NOT NULL DEFAULT 0,
+  end_time   INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+
+-- FTS5 full-text index
+CREATE VIRTUAL TABLE session_chunks_fts
+USING fts5(text, id UNINDEXED, file_path UNINDEXED, session_id UNINDEXED, tokenize='unicode61');
 ```
 
-## 4. 工作流程
+### 3.4 Legacy History (Layer 1 fallback)
 
-### 4.1 memory_store — 写入记忆
+Reads Claude Code's `~/.claude/history.jsonl` directly. Each line is a JSON object:
+
+```json
+{ "display": "user prompt text", "timestamp": 1708000000000, "project": "/path", "sessionId": "..." }
+```
+
+## 4. Workflows
+
+### 4.1 memory_store — Write Memory
 
 ```mermaid
 flowchart LR
-    A["memory_store(text, category)"] --> B["Zod 校验"]
-    B --> C["生成 UUID + hash"]
+    A["memory_store(text, category)"] --> B["Zod validation"]
+    B --> C["Generate UUID + hash"]
     C --> D["INSERT OR IGNORE INTO memories"]
-    D --> E{是否重复?}
-    E -->|是| F["返回 action=duplicate"]
-    E -->|否| G["触发器同步到 FTS5"]
-    G --> H["返回 action=stored"]
+    D --> E{Duplicate?}
+    E -->|Yes| F["Return action=duplicate"]
+    E -->|No| G["Trigger syncs to FTS5"]
+    G --> H["Return action=stored"]
 ```
 
-### 4.2 memory_search — 搜索记忆
+### 4.2 memory_search — Search Memory
 
 ```mermaid
 flowchart TD
-    A["memory_search(query, limit)"] --> B["Zod 校验"]
+    A["memory_search(query, limit)"] --> B["Zod validation"]
 
-    B --> C1["① 长期记忆检索"]
+    B --> C1["① Long-term Memory"]
     C1 --> C1a["FTS5 MATCH + bm25 → TopK"]
-    C1a --> C1b{有结果?}
-    C1b -->|否| C1c["LIKE 兜底 + 手动评分 → TopK"]
-    C1b -->|是| MERGE
+    C1a --> C1b{Results found?}
+    C1b -->|No| C1c["LIKE fallback + manual scoring → TopK"]
+    C1b -->|Yes| MERGE
     C1c --> MERGE
 
-    B --> C2["② 会话历史检索"]
-    C2 --> C2a["读取 history.jsonl"]
-    C2a --> C2b["关键词评分 → TopK"]
+    B --> C2["② Session Index"]
+    C2 --> C2a["syncSessionsIfNeeded()"]
+    C2a --> C2b["FTS5 MATCH + bm25 → TopK"]
     C2b --> MERGE
 
-    B --> C3["③ 知识库检索"]
+    B --> C3["③ Knowledge Base"]
     C3 --> C3a["syncKnowledgeIfNeeded()"]
     C3a --> C3b["FTS5 MATCH + bm25 → TopK"]
     C3b --> MERGE
 
-    MERGE["合并候选"] --> RERANK["重要度加权重排"]
-    RERANK --> SORT["按 finalScore 降序 + 时间降序"]
-    SORT --> TOP["取 Top N"]
-    TOP --> OUT["返回 {results}"]
+    B --> C4["④ Legacy History"]
+    C4 --> C4a["Read history.jsonl"]
+    C4a --> C4b["Keyword scoring → TopK"]
+    C4b --> MERGE
+
+    MERGE["Merge candidates"] --> RERANK["Importance-weighted re-ranking"]
+    RERANK --> SORT["Sort by finalScore desc + time desc"]
+    SORT --> TOP["Take Top N"]
+    TOP --> OUT["Return {results}"]
 ```
 
-### 4.3 memory_forget — 删除记忆
+### 4.3 memory_forget — Delete Memory
 
 ```mermaid
 flowchart LR
-    A["memory_forget(id)"] --> B["Zod 校验"]
+    A["memory_forget(id)"] --> B["Zod validation"]
     B --> C["DELETE FROM memories"]
-    C --> D["触发器同步删除 FTS5"]
-    D --> E["返回 {deleted: true/false}"]
+    C --> D["Trigger syncs delete from FTS5"]
+    D --> E["Return {deleted: true/false}"]
 ```
 
-### 4.4 知识索引同步流程
+### 4.4 Knowledge Index Sync Flow
 
 ```mermaid
 flowchart TD
-    START["启动 / 搜索前触发"] --> META{chunk 配置变更?}
-    META -->|是| FULL["全量重建（清库 + 重新分块 + 索引）"]
-    META -->|否| CHECK{KNOWLEDGE_PATH 非空?}
+    START["Startup / pre-search trigger"] --> META{Chunk config changed?}
+    META -->|Yes| FULL["Full rebuild (clear + re-chunk + re-index)"]
+    META -->|No| CHECK{KNOWLEDGE_PATH set?}
 
-    CHECK -->|否| SKIP["跳过"]
-    CHECK -->|是| DIRTY{watcher dirty<br/>或 文件变更?}
+    CHECK -->|No| SKIP["Skip"]
+    CHECK -->|Yes| DIRTY{Watcher dirty<br/>or files changed?}
 
-    DIRTY -->|否| SKIP2["跳过（冷却期内）"]
-    DIRTY -->|是| SCAN["递归扫描 .md 文件"]
+    DIRTY -->|No| SKIP2["Skip (within cooldown)"]
+    DIRTY -->|Yes| SCAN["Recursively scan .md files"]
 
-    SCAN --> COMPARE["mtime 变化 → 计算 hash 对比"]
-    COMPARE --> CHANGED{hash 变化?}
-    CHANGED -->|否| NEXT["跳过该文件"]
-    CHANGED -->|是| DELETE["删除旧 chunks + FTS"]
-    DELETE --> CHUNK["重新分块（近似 token：400/80）"]
-    CHUNK --> INSERT["插入新 chunks + FTS"]
+    SCAN --> COMPARE["mtime changed → compute hash comparison"]
+    COMPARE --> CHANGED{Hash changed?}
+    CHANGED -->|No| NEXT["Skip this file"]
+    CHANGED -->|Yes| DELETE["Delete old chunks + FTS entries"]
+    DELETE --> CHUNK["Re-chunk (approx tokens: 400/80)"]
+    CHUNK --> INSERT["Insert new chunks + FTS entries"]
     INSERT --> NEXT
-    NEXT --> CLEAN["清理磁盘已删除的文件记录"]
-    CLEAN --> SAVEMETA["更新 knowledge_meta"]
+    NEXT --> CLEAN["Clean up records for deleted files"]
+    CLEAN --> SAVEMETA["Update knowledge_meta"]
 
     FULL --> SCAN
 ```
 
-### 4.5 分块策略
+### 4.5 Session Index Sync Flow
+
+```mermaid
+flowchart TD
+    START["Startup / pre-search trigger"] --> COOL{Within cooldown?}
+    COOL -->|Yes| SKIP["Skip"]
+    COOL -->|No| SCAN["List all .jsonl files under SESSIONS_PATH"]
+
+    SCAN --> COUNT{File count matches DB?}
+    COUNT -->|No| SYNC["Full sync"]
+    COUNT -->|Yes| SAMPLE["Sample check mtime of first 20 files"]
+    SAMPLE --> CHANGED{Any mtime changed?}
+    CHANGED -->|No| DONE["Skip"]
+    CHANGED -->|Yes| SYNC
+
+    SYNC --> ITER["For each file"]
+    ITER --> MTIME{mtime changed?}
+    MTIME -->|No| SKIPFILE["Skip file"]
+    MTIME -->|Yes| HASH{Hash changed?}
+    HASH -->|No| UPDATEMTIME["Update mtime only"]
+    HASH -->|Yes| REBUILD["Delete old chunks → extract messages → re-chunk → insert"]
+    REBUILD --> NEXTFILE["Next file"]
+    SKIPFILE --> NEXTFILE
+    UPDATEMTIME --> NEXTFILE
+    NEXTFILE --> CLEANUP["Remove records for deleted files"]
+```
+
+### 4.6 Chunking Strategy
 
 ```mermaid
 flowchart LR
-    A[".md 文件内容"] --> B["按行遍历"]
-    B --> C["approxTokenCount 估算 token"]
-    C --> D{累计 > CHUNK_TOKENS?}
-    D -->|否| E["继续累加"]
-    D -->|是| F["flush 当前块"]
-    F --> G["保留尾部 overlap"]
+    A[".md file / session messages"] --> B["Iterate by line/message"]
+    B --> C["approxTokenCount estimation"]
+    C --> D{Accumulated > CHUNK_TOKENS?}
+    D -->|No| E["Continue accumulating"]
+    D -->|Yes| F["Flush current chunk"]
+    F --> G["Carry tail overlap"]
     G --> B
 ```
 
-**近似 token 估算**：
-- ASCII 字符：每 4 字符 ≈ 1 token
-- 非 ASCII 字符（中文等）：每字符 ≈ 1 token
+**Approximate token estimation:**
+- ASCII characters: 4 chars ≈ 1 token
+- Non-ASCII characters (CJK, etc.): 1 char ≈ 1 token
 
-### 4.6 文件监听（可选）
+### 4.7 File Watcher (Optional)
 
 ```mermaid
 flowchart LR
-    A["fs.watch(KNOWLEDGE_PATH)"] --> B["文件变更事件"]
-    B --> C["防抖 1.5s"]
-    C --> D["标记 knowledgeDirty = true"]
-    D --> E["下次 syncKnowledgeIfNeeded 时触发同步"]
+    A["fs.watch(KNOWLEDGE_PATH)"] --> B["File change event"]
+    B --> C["Debounce 1.5s"]
+    C --> D["Set knowledgeDirty = true"]
+    D --> E["Next syncKnowledgeIfNeeded triggers sync"]
 ```
 
-- 通过 `MCP_MEMORY_WATCH=true` 启用
-- 使用 Node.js 原生 `fs.watch`（recursive 模式）
-- 防抖避免频繁触发
+- Enabled via `MCP_MEMORY_WATCH=true`
+- Uses native Node.js `fs.watch` (recursive mode)
+- Debounce prevents excessive triggers
 
-## 5. 检索策略
+## 5. Retrieval Strategy
 
-### 5.1 评分与排序
+### 5.1 Scoring and Ranking
 
-| 数据源 | 检索方式 | 基础评分 |
-|--------|----------|----------|
-| 长期记忆 | FTS5 MATCH (LIKE 兜底) | `bm25()` 取反 / 手动评分 |
-| 会话历史 | 全量扫描 | `scoreText()` 关键词评分 |
-| 知识索引 | FTS5 MATCH | `bm25()` 取反 |
+| Source | Retrieval Method | Base Score |
+|--------|-----------------|------------|
+| Long-term memory | FTS5 MATCH (LIKE fallback) | Negated `bm25()` / manual scoring |
+| Session index | FTS5 MATCH | Negated `bm25()` |
+| Knowledge index | FTS5 MATCH | Negated `bm25()` |
+| Legacy history | Full scan | `scoreText()` keyword scoring |
 
-**重排策略**：
-- 每个来源先取 TopK 候选
+**Re-ranking strategy:**
+- Each source produces TopK candidates first
 - `finalScore = baseScore + importanceBoost`
-- `importanceBoost` 由**来源权重 + 结构权重 + 类别权重**组成
-- 按 `finalScore` 降序 → `createdAt` 降序取 Top N
+- `importanceBoost` = source weight + structure weight + category weight
+- Sort by `finalScore` desc → `createdAt` desc → take Top N
 
-### 5.2 重要度加权
+### 5.2 Importance Weights
 
-- **来源权重**：memory > knowledge > history
-- **结构权重**：标题行（`^#`）、列表项（`^-`/`*`/`\d+\.`）、代码块（` ``` `）
-- **类别权重**：`decision`、`preference` 适度加权
+**Source weights:**
+| Source | Weight |
+|--------|--------|
+| `memory` | 1.0 |
+| `knowledge` | 0.9 |
+| `session` | 0.75 |
+| `history` | 0.6 |
 
-### 5.3 FTS5 查询构造
+**Category weights:**
+| Category | Weight |
+|----------|--------|
+| `decision` | 0.8 |
+| `preference` | 0.6 |
+| `fact` | 0.3 |
+| `entity` | 0.2 |
+| `other` | 0 |
+
+**Structure weights (Markdown):**
+| Pattern | Weight |
+|---------|--------|
+| Headings (`^#`) | 0.6 |
+| List items (`^-`/`*`/`\d+\.`) | 0.4 |
+| Code blocks (`` ``` ``) | 0.3 |
+
+### 5.3 FTS5 Query Construction
 
 ```
-原始 query: "API 配置方法"
-  → 分词: ["API", "配置方法"]
-  → FTS5 query: "API"* OR "配置方法"*
+Input query: "API configuration method"
+  → Tokenize: ["API", "configuration", "method"]
+  → FTS5 query: "API"* OR "configuration"* OR "method"*
 ```
 
-- 标点符号替换为空格
-- 每个 token 加 `"..."*` 支持前缀匹配
-- 多个 token 用 `OR` 连接
-- unicode61 tokenizer 支持中英文
+- Punctuation replaced with spaces
+- Each token wrapped in `"..."*` for prefix matching
+- Multiple tokens joined with `OR`
+- `unicode61` tokenizer supports multilingual text
 
-## 6. 启动流程
+## 6. Startup Sequence
 
 ```mermaid
 sequenceDiagram
     participant Main as server.ts main()
     participant DB as db.ts
     participant Knowledge as knowledge.ts
+    participant Sessions as sessions.ts
     participant MCP as McpServer
 
-    Main->>DB: import getDb() (触发模块初始化)
-    DB->>DB: 建 memories 表 + FTS5 + 触发器
-    DB->>DB: FTS 迁移（灌入已有数据）
-    DB->>DB: hash 列迁移（旧库兼容）
-    DB->>Knowledge: initKnowledgeSchema() (如 KNOWLEDGE_PATH 非空)
-    Knowledge->>DB: 建 knowledge_files / knowledge_chunks / FTS5 / meta 表
+    Main->>DB: import getDb() (triggers module init)
+    DB->>DB: Create memories table + FTS5 + triggers
+    DB->>DB: FTS migration (backfill existing data)
+    DB->>DB: Hash column migration (legacy compat)
+    DB->>Knowledge: initKnowledgeSchema() (if KNOWLEDGE_PATH set)
+    Knowledge->>DB: Create knowledge_files / knowledge_chunks / FTS5 / meta tables
+    DB->>Sessions: initSessionSchema()
+    Sessions->>DB: Create session_files / session_chunks / FTS5 tables
 
     alt SYNC_ON_START = true
-        Main->>Knowledge: syncKnowledge() (全量同步)
-        Knowledge->>Knowledge: 扫描 .md → 近似 token 分块 → 入库
+        Main->>Knowledge: syncKnowledge() (full sync)
+        Knowledge->>Knowledge: Scan .md → approx token chunking → index
+        Main->>Sessions: syncSessions() (full sync)
+        Sessions->>Sessions: Scan .jsonl → extract messages → chunk → index
     end
 
     alt WATCH_ENABLED = true
         Main->>Knowledge: initKnowledgeWatcher()
-        Knowledge->>Knowledge: fs.watch + 防抖 → dirty 标记
+        Knowledge->>Knowledge: fs.watch + debounce → dirty flag
     end
 
     Main->>MCP: server.connect(StdioServerTransport)
-    MCP-->>Main: 等待 Claude Code 连接
+    MCP-->>Main: Waiting for Claude Code connection
 ```
 
-## 7. 配置项
+## 7. Configuration Reference
 
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `MCP_MEMORY_DB_PATH` | `./memory.sqlite` | SQLite 数据库路径 |
-| `MCP_MEMORY_CLAUDE_HISTORY_PATH` | `~/.claude/history.jsonl` | 会话历史文件 |
-| `MCP_MEMORY_KNOWLEDGE_PATH` | （空） | 知识目录，为空则不启用知识索引 |
-| `MCP_MEMORY_DEFAULT_LIMIT` | `5` | 默认搜索结果数 |
-| `MCP_MEMORY_MAX_LIMIT` | `20` | 最大搜索结果数 |
-| `MCP_MEMORY_CHUNK_TOKENS` | `400` | 知识索引分块大小（近似 token） |
-| `MCP_MEMORY_CHUNK_OVERLAP_TOKENS` | `80` | 分块重叠大小（近似 token） |
-| `MCP_MEMORY_SYNC_COOLDOWN_MS` | `5000` | 搜索前增量同步冷却时间（ms） |
-| `MCP_MEMORY_SYNC_ON_START` | `true` | 启动时是否全量同步知识索引 |
-| `MCP_MEMORY_WATCH` | `false` | 是否启用知识目录文件监听 |
-| `MCP_MEMORY_WATCH_DEBOUNCE_MS` | `1500` | 文件监听防抖时间（ms） |
+See [README.md — Environment Variables](README.md#environment-variables) for the full configuration table.
 
-## 8. 三层记忆体系
+## 8. Three-Layer Memory System
 
 ```mermaid
 graph TD
-    subgraph "第 1 层：会话转录"
-        L1["history.jsonl"]
-        L1D["Claude Code 自动写入<br/>memory_search 时全量扫描"]
+    subgraph "Layer 1: Session Transcripts"
+        L1["Session JSONL Files"]
+        L1D["Auto-indexed from Claude Code sessions<br/>FTS5 chunked search"]
     end
 
-    subgraph "第 2 层：知识索引"
-        L2["知识目录 .md 文件"]
-        L2D["近似 token 分块 + FTS5 索引<br/>增量同步 (hash/mtime) + watcher"]
+    subgraph "Layer 2: Knowledge Index"
+        L2["Knowledge .md Files"]
+        L2D["Approx token chunking + FTS5 index<br/>Incremental sync (hash/mtime) + watcher"]
     end
 
-    subgraph "第 3 层：长期记忆"
-        L3["memories 表"]
-        L3D["memory_store 写入<br/>FTS5 + 触发器同步"]
+    subgraph "Layer 3: Long-term Memory"
+        L3["memories table"]
+        L3D["Written via memory_store<br/>FTS5 + trigger sync"]
     end
 
-    L1 --> SEARCH["memory_search<br/>三源合并 + 重要度重排"]
+    L1 --> SEARCH["memory_search<br/>Three-source merge + importance re-ranking"]
     L2 --> SEARCH
     L3 --> SEARCH
 
@@ -372,22 +454,8 @@ graph TD
     style SEARCH fill:#f3e5f5,stroke:#9c27b0
 ```
 
-| 层级 | 数据来源 | 写入方式 | 索引方式 | 特点 |
-|------|----------|----------|----------|------|
-| 第 1 层 | `history.jsonl` | Claude Code 自动 | 全量扫描 + 关键词评分 | 零配置，低精度 |
-| 第 2 层 | 知识目录 `.md` | 用户手动放文件 | FTS5 分块索引（近似 token） | 高精度，需维护文件 |
-| 第 3 层 | `memory_store` | Claude Code 调用 / 用户触发 | FTS5 + 触发器 | 精准，CLAUDE.md 驱动 |
-
-## 9. 与 OpenClaw 第二层的差异
-
-| 能力 | 本项目 | OpenClaw | 差异原因 |
-|------|--------|----------|----------|
-| 分块策略 | 近似 token（400/80） | 精确 token（400/80） | 轻量实现，免外部依赖 |
-| 索引方式 | FTS5 BM25 | FTS5 + 向量混合 | 不引入嵌入模型 |
-| 语义召回 | 无（仅关键词） | 有（向量嵌入） | 不引入嵌入模型 |
-| 会话数据源 | history.jsonl | sessions JSONL 分块索引 | 复用 Claude Code 原生 |
-| 增量同步 | hash/mtime + meta | hash/mtime | 基本对齐 |
-| 配置变更重建 | knowledge_meta 检测 | meta 表检测 | 基本对齐 |
-| 文件监听 | fs.watch（可选） | chokidar + 防抖 | 免外部依赖 |
-| 安全重建 | 事务内全量清除+重建 | 临时库 → 原子交换 | 知识索引与主库共用同一 SQLite |
-| 嵌入缓存 | 无 | embedding_cache | 无向量则无需缓存 |
+| Layer | Source | Write Method | Index Method | Characteristics |
+|-------|--------|-------------|-------------|-----------------|
+| Layer 1 | Session JSONL | Auto (Claude Code) | FTS5 chunked index | Zero-config, full transcript search |
+| Layer 2 | Knowledge `.md` | User drops files | FTS5 chunked index (approx. tokens) | High precision, requires file maintenance |
+| Layer 3 | `memory_store` | Claude Code / user | FTS5 + triggers | Precise, CLAUDE.md-driven |
